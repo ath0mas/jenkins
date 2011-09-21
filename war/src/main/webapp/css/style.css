@@ -109,7 +109,7 @@ dt {
   font-size: 8pt;
   margin-top: 10em;
   padding: 10px;
-  border-top: 1px solid #bbb;
+  border-top: 1px solid #d9d8d6;
 }
 
 #tasks {
@@ -179,7 +179,7 @@ a.tip:hover span {
   top:2em;
   left:2em;
   width:400px;
-  border:1px solid #bbbbbb;
+  border:1px solid #d9d8d6;
   background-color:#fffff0;
   color:#000;
   text-align: left
@@ -218,7 +218,7 @@ td.tab_filler {
 td.tab {
   vertical-align: middle;
   border: 1px #090 solid;
-  background: #f0f0f0;
+  background: #fffaea;
 }
 
 .dashboard td {
@@ -322,41 +322,41 @@ div.dashboard {
 table.pane {
   width: 100%;
   border-collapse: collapse;
-  border: 1px #bbb solid;
+  border: 1px #d9d8d6 solid;
 }
 
 td.pane {
-  border: 1px #bbb solid;
+  border: 1px #d9d8d6 solid;
   padding: 3px 4px 3px 4px;
   vertical-align: middle;
 }
 
 td.pane-header {
-  border: 1px #bbb solid;
+  border: 1px #d9d8d6 solid;
   border-right: none;
   border-left: none;
-  background-color: #f0f0f0;
+  background-color: #fffaea;
   font-weight: bold;
 }
 
 th.pane {
-  border: 1px #bbb solid;
+  border: 1px #d9d8d6 solid;
   font-weight: bold;
 }
 
 .bigtable tr {
-  border: 1px solid #bbb;
+  border: 1px solid #d9d8d6;
   padding: 3px 4px 3px 4px;
 }
 
 .bigtable tr:hover {
-  background-color: #f0f0f0;
+  background-color: #fffaea;
 }
 
 .bigtable th {
   font-weight: bold;
   border: none;
-  background-color: #f0f0f0;
+  background-color: #fffaea;
   padding: 3px 4px 3px 4px;
 }
 
@@ -526,8 +526,8 @@ LABEL.attach-previous {
 
 .help {
   display: none;  /* hidden until loaded */
-  border: solid #bbb 1px;
-  background-color: #f0f0f0;
+  border: solid #d9d8d6 1px;
+  background-color: #fffaea;
   padding: 1em;
   margin-bottom: 1em;
 }
@@ -549,10 +549,10 @@ LABEL.attach-previous {
 }
 #viewList td.inactive {
   border: solid 1px #ccc;
-  border-bottom-color: #bbb;
+  border-bottom-color: #d9d8d6;
 }
 #viewList td.inactive:hover {
-  background-color: #777;
+  background-color: #f7f1da;
 }
 #viewList td.inactive a {
   text-decoration: none;
@@ -565,17 +565,17 @@ LABEL.attach-previous {
   border-right: none;
 }
 #viewList td.active {
-  border: solid 1px #bbb;
+  border: solid 1px #d9d8d6;
   padding: 0.5em;
   border-bottom: none;
   vertical-align:middle;
-  background-color: rgb(240,240,240);
+  background-color: #fffaea;
   font-weight: bold;
   white-space: nowrap;
 }
 #viewList td.filler {
   border: none;
-  border-bottom: solid 1px #bbb;
+  border-bottom: solid 1px #d9d8d6;
   width: 100%;
   text-align: right;
 }
@@ -604,7 +604,7 @@ table.parameters .setting-description {
 }
 
 table.parameters > tbody:hover {
-  background-color: #f0f0f0;
+  background-color: #fffaea;
 }
 
 /* ============================ health report hover ========================== */
@@ -625,7 +625,7 @@ table.parameters > tbody:hover {
     display: block;
     position: absolute;
     background-color: #ffe;
-    border: 1px solid #bbb;
+    border: 1px solid #d9d8d6;
     margin-left: 32px; /* move it across a bit */
     z-index: 26;
 }
