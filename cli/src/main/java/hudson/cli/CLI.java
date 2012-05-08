@@ -23,10 +23,7 @@
  */
 package hudson.cli;
 
-import com.trilead.ssh2.crypto.Base64;
 import com.trilead.ssh2.crypto.PEMDecoder;
-import com.trilead.ssh2.signature.DSASHA1Verify;
-import com.trilead.ssh2.signature.RSASHA1Verify;
 import hudson.cli.client.Messages;
 import hudson.remoting.Channel;
 import hudson.remoting.PingThread;
@@ -38,8 +35,10 @@ import hudson.remoting.SocketOutputStream;
 
 import java.io.BufferedInputStream;
 import java.io.BufferedOutputStream;
+import java.io.BufferedReader;
 import java.io.ByteArrayInputStream;
 import java.io.ByteArrayOutputStream;
+import java.io.Closeable;
 import java.io.DataInputStream;
 import java.io.DataOutputStream;
 import java.io.File;
@@ -47,6 +46,10 @@ import java.io.FileInputStream;
 import java.io.IOException;
 import java.io.InputStream;
 import java.io.OutputStream;
+import java.io.PrintStream;
+import java.io.StringReader;
+import java.net.HttpURLConnection;
+import java.net.InetSocketAddress;
 import java.net.Socket;
 import java.net.URL;
 import java.net.URLConnection;
@@ -61,10 +64,12 @@ import java.util.Arrays;
 import java.util.Collections;
 import java.util.List;
 import java.util.Locale;
+import java.util.Properties;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
 import java.util.logging.Level;
 import java.util.logging.Logger;
+import java.io.Console;
 
 import static java.util.logging.Level.*;
 
@@ -78,12 +83,36 @@ public class CLI {
     private final Channel channel;
     private final CliEntryPoint entryPoint;
     private final boolean ownsPool;
+    private final List<Closeable> closables = new ArrayList<Closeable>(); // stuff to close in the close method
+    private final String httpsProxyTunnel;
+    private final String authorization;
 
     public CLI(URL jenkins) throws IOException, InterruptedException {
         this(jenkins,null);
     }
 
+    /**
+     * @deprecated
+     *      Use {@link CLIConnectionFactory} to create {@link CLI}
+     */
     public CLI(URL jenkins, ExecutorService exec) throws IOException, InterruptedException {
+        this(jenkins,exec,null);
+    }
+
+    /**
+     * @deprecated 
+     *      Use {@link CLIConnectionFactory} to create {@link CLI}
+     */
+    public CLI(URL jenkins, ExecutorService exec, String httpsProxyTunnel) throws IOException, InterruptedException {
+        this(new CLIConnectionFactory().url(jenkins).executorService(exec).httpsProxyTunnel(httpsProxyTunnel));
+    }
+    
+    /*package*/ CLI(CLIConnectionFactory factory) throws IOException, InterruptedException {
+        URL jenkins = factory.jenkins;
+        this.httpsProxyTunnel = factory.httpsProxyTunnel;
+        this.authorization = factory.authorization;
+        ExecutorService exec = factory.exec;
+        
         String url = jenkins.toExternalForm();
         if(!url.endsWith("/"))  url+='/';
 
@@ -91,11 +120,11 @@ public class CLI {
         pool = exec!=null ? exec : Executors.newCachedThreadPool();
 
         Channel channel = null;
-        int clip = getCliTcpPort(url);
-        if(clip>=0) {
+        InetSocketAddress clip = getCliTcpPort(url);
+        if(clip!=null) {
             // connect via CLI port
             try {
-                channel = connectViaCliPort(jenkins, url, clip);
+                channel = connectViaCliPort(jenkins, clip);
             } catch (IOException e) {
                 LOGGER.log(Level.FINE,"Failed to connect via CLI port. Falling back to HTTP",e);
             }
@@ -118,10 +147,12 @@ public class CLI {
         url+="cli";
         URL jenkins = new URL(url);
 
-        FullDuplexHttpStream con = new FullDuplexHttpStream(jenkins);
+        FullDuplexHttpStream con = new FullDuplexHttpStream(jenkins,authorization);
         Channel ch = new Channel("Chunked connection to "+jenkins,
                 pool,con.getInputStream(),con.getOutputStream());
-        new PingThread(ch,30*1000) {
+        final long interval = 15*1000;
+        final long timeout = (interval * 3) / 4;
+        new PingThread(ch,timeout,interval) {
             protected void onDead() {
                 // noop. the point of ping is to keep the connection alive
                 // as most HTTP servers have a rather short read time out
@@ -130,31 +161,102 @@ public class CLI {
         return ch;
     }
 
-    private Channel connectViaCliPort(URL jenkins, String url, int clip) throws IOException {
-        String host = new URL(url).getHost();
-        LOGGER.fine("Trying to connect directly via TCP/IP to port "+clip+" of "+host);
-        Socket s = new Socket(host,clip);
+    private Channel connectViaCliPort(URL jenkins, InetSocketAddress endpoint) throws IOException {
+        LOGGER.fine("Trying to connect directly via TCP/IP to "+endpoint);
+        final Socket s;
+        OutputStream out;
+
+        if (httpsProxyTunnel!=null) {
+            String[] tokens = httpsProxyTunnel.split(":");
+            s = new Socket(tokens[0], Integer.parseInt(tokens[1]));
+            PrintStream o = new PrintStream(s.getOutputStream());
+            o.print("CONNECT " + endpoint.getHostName() + ":" + endpoint.getPort() + " HTTP/1.0\r\n\r\n");
+
+            // read the response from the proxy
+            ByteArrayOutputStream rsp = new ByteArrayOutputStream();
+            while (!rsp.toString().endsWith("\r\n\r\n")) {
+                int ch = s.getInputStream().read();
+                if (ch<0)   throw new IOException("Failed to read the HTTP proxy response: "+rsp);
+                rsp.write(ch);
+            }
+            String head = new BufferedReader(new StringReader(rsp.toString())).readLine();
+            if (!head.startsWith("HTTP/1.0 200 "))
+                throw new IOException("Failed to establish a connection through HTTP proxy: "+rsp);
+
+            // HTTP proxies (at least the one I tried --- squid) doesn't seem to do half-close very well.
+            // So instead of relying on it, we'll just send the close command and then let the server
+            // cut their side, then close the socket after the join.
+            out = new SocketOutputStream(s) {
+                @Override
+                public void close() throws IOException {
+                    // ignore
+                }
+            };
+        } else {
+            s = new Socket();
+            s.connect(endpoint,3000);
+            out = new SocketOutputStream(s);
+        }
+
+        closables.add(new Closeable() {
+            public void close() throws IOException {
+                s.close();
+            }
+        });
+
         DataOutputStream dos = new DataOutputStream(s.getOutputStream());
         dos.writeUTF("Protocol:CLI-connect");
 
         return new Channel("CLI connection to "+jenkins, pool,
                 new BufferedInputStream(new SocketInputStream(s)),
-                new BufferedOutputStream(new SocketOutputStream(s)));
+                new BufferedOutputStream(out));
     }
 
     /**
-     * If the server advertises CLI port, returns it.
+     * If the server advertises CLI endpoint, returns its location.
      */
-    private int getCliTcpPort(String url) throws IOException {
+    private InetSocketAddress getCliTcpPort(String url) throws IOException {
         URLConnection head = new URL(url).openConnection();
         try {
             head.connect();
         } catch (IOException e) {
             throw (IOException)new IOException("Failed to connect to "+url).initCause(e);
         }
-        String p = head.getHeaderField("X-Hudson-CLI-Port");
-        if(p==null) return -1;
-        return Integer.parseInt(p);
+        String p = head.getHeaderField("X-Jenkins-CLI-Port");
+        if (p==null)    p = head.getHeaderField("X-Hudson-CLI-Port");   // backward compatibility
+        String h = head.getHeaderField("X-Jenkins-CLI-Host");
+        if (h==null)    h = head.getURL().getHost();
+        
+        flushURLConnection(head);
+        if (p==null)     return null;
+        
+        return new InetSocketAddress(h,Integer.parseInt(p));
+    }
+
+    /**
+     * Flush the supplied {@link URLConnection} input and close the
+     * connection nicely.
+     * @param conn the connection to flush/close
+     */
+    private void flushURLConnection(URLConnection conn) {
+        byte[] buf = new byte[1024];
+        try {
+            InputStream is = conn.getInputStream();
+            while (is.read(buf) > 0) {
+                // Ignore
+            }
+            is.close();
+        } catch (IOException e) {
+            try {
+                InputStream es = ((HttpURLConnection)conn).getErrorStream();
+                while (es.read(buf) > 0) {
+                    // Ignore
+                }
+                es.close();
+            } catch (IOException ex) {
+                // Ignore
+            }
+        }
     }
 
     /**
@@ -165,6 +267,8 @@ public class CLI {
         channel.join();
         if(ownsPool)
             pool.shutdown();
+        for (Closeable c : closables)
+            c.close();
     }
 
     public int execute(List<String> args, InputStream stdin, OutputStream stdout, OutputStream stderr) {
@@ -213,6 +317,12 @@ public class CLI {
     }
 
     public static void main(final String[] _args) throws Exception {
+//        Logger l = Logger.getLogger(Channel.class.getName());
+//        l.setLevel(ALL);
+//        ConsoleHandler h = new ConsoleHandler();
+//        h.setLevel(ALL);
+//        l.addHandler(h);
+//
         System.exit(_main(_args));
     }
 
@@ -220,6 +330,7 @@ public class CLI {
         List<String> args = Arrays.asList(_args);
         List<KeyPair> candidateKeys = new ArrayList<KeyPair>();
         boolean sshAuthRequestedExplicitly = false;
+        String httpProxy=null;
 
         String url = System.getenv("JENKINS_URL");
 
@@ -228,6 +339,10 @@ public class CLI {
 
         while(!args.isEmpty()) {
             String head = args.get(0);
+            if (head.equals("-version")) {
+                System.out.println("Version: "+computeVersion());
+                return 0;
+            }
             if(head.equals("-s") && args.size()>=2) {
                 url = args.get(1);
                 args = args.subList(2,args.size());
@@ -239,15 +354,24 @@ public class CLI {
                     printUsage(Messages.CLI_NoSuchFileExists(f));
                     return -1;
                 }
+                KeyPair kp = null;
                 try {
-                    candidateKeys.add(loadKey(f));
+                    kp = loadKey(f);
                 } catch (IOException e) {
-                    throw new Exception("Failed to load key: "+f,e);
+                    //if the PEM file is encrypted, IOException is thrown
+                    kp = tryEncryptedFile(f);                    
                 } catch (GeneralSecurityException e) {
                     throw new Exception("Failed to load key: "+f,e);
                 }
+                if(kp != null)
+                    candidateKeys.add(kp);
                 args = args.subList(2,args.size());
                 sshAuthRequestedExplicitly = true;
+                continue;
+            }
+            if(head.equals("-p") && args.size()>=2) {
+                httpProxy = args.get(1);
+                args = args.subList(2,args.size());
                 continue;
             }
             break;
@@ -264,7 +388,7 @@ public class CLI {
         if (candidateKeys.isEmpty())
             addDefaultPrivateKeyLocations(candidateKeys);
 
-        CLI cli = new CLI(new URL(url));
+        CLI cli = new CLI(new URL(url),null,httpProxy);
         try {
             if (!candidateKeys.isEmpty()) {
                 try {
@@ -286,8 +410,8 @@ public class CLI {
                         LOGGER.log(FINE,e.getMessage(),e);
                         return -1;
                     }
-                    System.err.println("Failed to authenticate with your SSH keys. Proceeding with anonymous access");
-                    LOGGER.log(FINE,"Failed to authenticate with your SSH keys. Proceeding with anonymous access",e);
+                    System.err.println("Failed to authenticate with your SSH keys.");
+                    LOGGER.log(FINE,"Failed to authenticate with your SSH keys.",e);
                 }
             }
 
@@ -300,22 +424,42 @@ public class CLI {
         }
     }
 
-    /**
-     * Loads RSA/DSA private key in a PEM format into {@link KeyPair}.
-     */
-    public static KeyPair loadKey(File f) throws IOException, GeneralSecurityException {
-        DataInputStream dis = new DataInputStream(new FileInputStream(f));
-        byte[] bytes = new byte[(int) f.length()];
-        dis.readFully(bytes);
-        dis.close();
-        return loadKey(new String(bytes));
+    private static String computeVersion() {
+        Properties props = new Properties();
+        try {
+            InputStream is = CLI.class.getResourceAsStream("/jenkins/cli/jenkins-cli-version.properties");
+            if(is!=null)
+                props.load(is);
+        } catch (IOException e) {
+            e.printStackTrace(); // if the version properties is missing, that's OK.
+        }
+        return props.getProperty("version","?");
     }
 
     /**
      * Loads RSA/DSA private key in a PEM format into {@link KeyPair}.
      */
-    public static KeyPair loadKey(String pemString) throws IOException, GeneralSecurityException {
-        Object key = PEMDecoder.decode(pemString.toCharArray(), null);
+    public static KeyPair loadKey(File f, String passwd) throws IOException, GeneralSecurityException {
+        return loadKey(readPemFile(f), passwd);
+    }
+
+    public static KeyPair loadKey(File f) throws IOException, GeneralSecurityException {
+    	return loadKey(f, null);
+    }
+    
+    private static String readPemFile(File f) throws IOException{
+        DataInputStream dis = new DataInputStream(new FileInputStream(f));
+        byte[] bytes = new byte[(int) f.length()];
+        dis.readFully(bytes);
+        dis.close();
+        return new String(bytes);
+    }
+    
+    /**
+     * Loads RSA/DSA private key in a PEM format into {@link KeyPair}.
+     */
+    public static KeyPair loadKey(String pemString, String passwd) throws IOException, GeneralSecurityException {
+        Object key = PEMDecoder.decode(pemString.toCharArray(), passwd);
         if (key instanceof com.trilead.ssh2.signature.RSAPrivateKey) {
             com.trilead.ssh2.signature.RSAPrivateKey x = (com.trilead.ssh2.signature.RSAPrivateKey)key;
 //            System.out.println("ssh-rsa " + new String(Base64.encode(RSASHA1Verify.encodeSSHRSAPublicKey(x.getPublicKey()))));
@@ -335,6 +479,41 @@ public class CLI {
         throw new UnsupportedOperationException("Unrecognizable key format: "+key);
     }
 
+    public static KeyPair loadKey(String pemString) throws IOException, GeneralSecurityException {
+    	return loadKey(pemString, null);
+    }
+    
+    private static KeyPair tryEncryptedFile(File f) throws IOException, GeneralSecurityException{
+        KeyPair kp = null;
+        if(isPemEncrypted(f)){
+            String passwd = askForPasswd(f.getCanonicalPath());
+            kp = loadKey(f,passwd);
+        }
+        return kp;
+    }
+    
+    private static boolean isPemEncrypted(File f) throws IOException{
+        String pemString = readPemFile(f);
+        //simple check if the file is encrypted
+        if(pemString.contains("4,ENCRYPTED"))
+            return true;
+        return false;
+    }
+    
+    private static String askForPasswd(String filePath){
+        try {
+            Console cons = System.console();
+            String passwd = null;
+            if (cons != null){
+                char[] p = cons.readPassword("%s", "Enter passphrase for "+filePath+":");
+                passwd = String.valueOf(p);
+            }
+            return passwd;
+        } catch (LinkageError e) {
+            throw new Error("Your private key is encrypted, but we need Java6 to ask you password safely",e);
+        }
+    }
+    
     /**
      * try all the default key locations
      */

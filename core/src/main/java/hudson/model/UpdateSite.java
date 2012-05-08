@@ -32,8 +32,10 @@ import hudson.lifecycle.Lifecycle;
 import hudson.model.UpdateCenter.UpdateCenterJob;
 import hudson.util.FormValidation;
 import hudson.util.FormValidation.Kind;
+import hudson.util.HttpResponses;
 import hudson.util.IOUtils;
 import hudson.util.TextFile;
+import hudson.util.TimeUnit2;
 import hudson.util.VersionNumber;
 import jenkins.model.Jenkins;
 import net.sf.json.JSONException;
@@ -43,14 +45,18 @@ import org.apache.commons.io.output.TeeOutputStream;
 import org.jvnet.hudson.crypto.CertificateUtil;
 import org.jvnet.hudson.crypto.SignatureOutputStream;
 import org.kohsuke.stapler.DataBoundConstructor;
+import org.kohsuke.stapler.HttpResponse;
+import org.kohsuke.stapler.QueryParameter;
 import org.kohsuke.stapler.StaplerRequest;
 import org.kohsuke.stapler.StaplerResponse;
 
 import javax.servlet.ServletContext;
 import java.io.ByteArrayInputStream;
 import java.io.File;
+import java.io.FileInputStream;
 import java.io.IOException;
 import java.io.OutputStreamWriter;
+import java.io.Writer;
 import java.security.DigestOutputStream;
 import java.security.GeneralSecurityException;
 import java.security.MessageDigest;
@@ -101,6 +107,22 @@ public class UpdateSite {
      * all at once.
      */
     private transient volatile long lastAttempt = -1;
+
+    /**
+     * If the attempt to fetch data fails, we progressively use longer time out before retrying,
+     * to avoid overloading the server.
+     */
+    private transient volatile long retryWindow;
+
+    /**
+     * lastModified time of the data file when it was last read.
+     */
+    private transient long dataLastReadFromFile;
+
+    /**
+     * Latest data as read from the data file.
+     */
+    private Data data;
 
     /**
      * ID string for this update source.
@@ -157,6 +179,7 @@ public class UpdateSite {
         }
 
         LOGGER.info("Obtained the latest update center data file for UpdateSource " + id);
+        retryWindow = 0;
         getDataFile().write(json);
         return FormValidation.ok();
     }
@@ -193,12 +216,25 @@ public class UpdateSite {
                     certs.add(c);
                 }
 
-                // all default root CAs in JVM are trusted, plus certs bundled in Jenkins
+                // if we trust default root CAs, we end up trusting anyone who has a valid certificate,
+                // which isn't useful at all
                 Set<TrustAnchor> anchors = new HashSet<TrustAnchor>(); // CertificateUtil.getDefaultRootCAs();
-                ServletContext context = Jenkins.getInstance().servletContext;
-                for (String cert : (Set<String>) context.getResourcePaths("/WEB-INF/update-center-rootCAs")) {
+                Jenkins j = Jenkins.getInstance();
+                for (String cert : (Set<String>) j.servletContext.getResourcePaths("/WEB-INF/update-center-rootCAs")) {
                     if (cert.endsWith(".txt"))  continue;       // skip text files that are meant to be documentation
-                    anchors.add(new TrustAnchor((X509Certificate)cf.generateCertificate(context.getResourceAsStream(cert)),null));
+                    anchors.add(new TrustAnchor((X509Certificate)cf.generateCertificate(j.servletContext.getResourceAsStream(cert)),null));
+                }
+                File[] cas = new File(j.root, "update-center-rootCAs").listFiles();
+                if (cas!=null) {
+                    for (File cert : cas) {
+                        if (cert.getName().endsWith(".txt"))  continue;       // skip text files that are meant to be documentation
+                        FileInputStream in = new FileInputStream(cert);
+                        try {
+                            anchors.add(new TrustAnchor((X509Certificate)cf.generateCertificate(in),null));
+                        } finally {
+                            in.close();
+                        }
+                    }
                 }
                 CertificateUtil.validatePath(certs,anchors);
             }
@@ -212,17 +248,36 @@ public class UpdateSite {
             sig.initVerify(certs.get(0));
             SignatureOutputStream sos = new SignatureOutputStream(sig);
 
+            // until JENKINS-11110 fix, UC used to serve invalid digest (and therefore unverifiable signature)
+            // that only covers the earlier portion of the file. This was caused by the lack of close() call
+            // in the canonical writing, which apparently leave some bytes somewhere that's not flushed to
+            // the digest output stream. This affects Jenkins [1.424,1,431].
+            // Jenkins 1.432 shipped with the "fix" (1eb0c64abb3794edce29cbb1de50c93fa03a8229) that made it
+            // compute the correct digest, but it breaks all the existing UC json metadata out there. We then
+            // quickly discovered ourselves in the catch-22 situation. If we generate UC with the correct signature,
+            // it'll cut off [1.424,1.431] from the UC. But if we don't, we'll cut off [1.432,*).
+            //
+            // In 1.433, we revisited 1eb0c64abb3794edce29cbb1de50c93fa03a8229 so that the original "digest"/"signature"
+            // pair continues to be generated in a buggy form, while "correct_digest"/"correct_signature" are generated
+            // correctly.
+            //
+            // Jenkins should ignore "digest"/"signature" pair. Accepting it creates a vulnerability that allows
+            // the attacker to inject a fragment at the end of the json.
             o.writeCanonical(new OutputStreamWriter(new TeeOutputStream(dos,sos),"UTF-8")).close();
 
             // did the digest match? this is not a part of the signature validation, but if we have a bug in the c14n
             // (which is more likely than someone tampering with update center), we can tell
             String computedDigest = new String(Base64.encode(sha1.digest()));
-            String providedDigest = signature.getString("digest");
+            String providedDigest = signature.optString("correct_digest");
+            if (providedDigest==null) {
+                return FormValidation.error("No correct_digest parameter in update center '"+id+"'. This metadata appears to be old.");
+            }
             if (!computedDigest.equalsIgnoreCase(providedDigest)) {
                 return FormValidation.error("Digest mismatch: "+computedDigest+" vs "+providedDigest+" in update center '"+id+"'");
             }
 
-            if (!sig.verify(Base64.decode(signature.getString("signature").toCharArray()))) {
+            String providedSignature = signature.getString("correct_signature");
+            if (!sig.verify(Base64.decode(providedSignature.toCharArray()))) {
                 return FormValidation.error("Signature in the update center doesn't match with the certificate in update center '"+id+"'");
             }
 
@@ -241,20 +296,45 @@ public class UpdateSite {
         if(dataTimestamp==-1)
             dataTimestamp = getDataFile().file.lastModified();
         long now = System.currentTimeMillis();
-        boolean due = now - dataTimestamp > DAY && now - lastAttempt > 15000;
-        if(due)     lastAttempt = now;
+        
+        retryWindow = Math.max(retryWindow,SECONDS.toMillis(15));
+        
+        boolean due = now - dataTimestamp > DAY && now - lastAttempt > retryWindow;
+        if(due) {
+            lastAttempt = now;
+            retryWindow = Math.min(retryWindow*2, HOURS.toMillis(1)); // exponential back off but at most 1 hour
+        }
         return due;
     }
 
     /**
-     * Loads the update center data, if any.
+     * Invalidates the cached data and force retrieval.
+     *
+     * @since 1.432
+     */
+    public HttpResponse doInvalidateData() {
+        Jenkins.getInstance().checkPermission(Jenkins.ADMINISTER);
+        dataTimestamp = 0;
+        return HttpResponses.ok();
+    }
+
+    /**
+     * Loads the update center data, if any and if modified since last read.
      *
      * @return  null if no data is available.
      */
     public Data getData() {
-        JSONObject o = getJSONObject();
-        if (o!=null)    return new Data(o);
-        return null;
+        TextFile df = getDataFile();
+        if (df.exists() && dataLastReadFromFile != df.file.lastModified()) {
+            JSONObject o = getJSONObject();
+            if (o!=null) {
+                data = new Data(o);
+                dataLastReadFromFile = df.file.lastModified();
+            } else {
+                data = null;
+            }
+        }
+        return data;
     }
 
     /**
@@ -642,21 +722,29 @@ public class UpdateSite {
             deploy();
         }
 
+        public Future<UpdateCenterJob> deploy() {
+            return deploy(false);
+        }
+
         /**
          * Schedules the installation of this plugin.
          *
          * <p>
          * This is mainly intended to be called from the UI. The actual installation work happens
          * asynchronously in another thread.
+         *
+         * @param dynamicLoad
+         *      If true, the plugin will be dynamically loaded into this Jenkins. If false,
+         *      the plugin will only take effect after the reboot.
          */
-        public Future<UpdateCenterJob> deploy() {
+        public Future<UpdateCenterJob> deploy(boolean dynamicLoad) {
             Jenkins.getInstance().checkPermission(Jenkins.ADMINISTER);
             UpdateCenter uc = Jenkins.getInstance().getUpdateCenter();
             for (Plugin dep : getNeededDependencies()) {
                 LOGGER.log(Level.WARNING, "Adding dependent install of " + dep.name + " for plugin " + name);
-                dep.deploy();
+                dep.deploy(dynamicLoad);
             }
-            return uc.addJob(uc.new InstallationJob(this, UpdateSite.this, Jenkins.getAuthentication()));
+            return uc.addJob(uc.new InstallationJob(this, UpdateSite.this, Jenkins.getAuthentication(), dynamicLoad));
         }
 
         /**
@@ -670,17 +758,22 @@ public class UpdateSite {
         /**
          * Making the installation web bound.
          */
-        public void doInstall(StaplerResponse rsp) throws IOException {
-            deploy();
-            rsp.sendRedirect2("../..");
+        public HttpResponse doInstall() throws IOException {
+            deploy(false);
+            return HttpResponses.redirectTo("../..");
+        }
+
+        public HttpResponse doInstallNow() throws IOException {
+            deploy(true);
+            return HttpResponses.redirectTo("../..");
         }
 
         /**
          * Performs the downgrade of the plugin.
          */
-        public void doDowngrade(StaplerResponse rsp) throws IOException {
+        public HttpResponse doDowngrade() throws IOException {
             deployBackup();
-            rsp.sendRedirect2("../..");
+            return HttpResponses.redirectTo("../..");
         }
     }
 

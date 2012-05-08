@@ -95,6 +95,22 @@ public class ItemListener implements ExtensionPoint {
     }
 
     /**
+     * Called after a job has its configuration updated.
+     *
+     * @since 1.460
+     */
+    public void onUpdated(Item item) {
+    }
+
+    /**
+     * @since 1.446
+     *      Called at the begenning of the orderly shutdown sequence to
+     *      allow plugins to clean up stuff
+     */
+    public void onBeforeShutdown() {
+    }
+
+    /**
      * Registers this instance to Hudson and start getting notifications.
      *
      * @deprecated as of 1.286
@@ -119,5 +135,10 @@ public class ItemListener implements ExtensionPoint {
     public static void fireOnCreated(Item item) {
         for (ItemListener l : all())
             l.onCreated(item);
+    }
+
+    public static void fireOnUpdated(Item item) {
+        for (ItemListener l : all())
+            l.onUpdated(item);
     }
 }

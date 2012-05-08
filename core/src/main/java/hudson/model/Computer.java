@@ -41,6 +41,7 @@ import hudson.security.Permission;
 import hudson.security.PermissionGroup;
 import hudson.security.PermissionScope;
 import hudson.slaves.ComputerLauncher;
+import hudson.slaves.ComputerListener;
 import hudson.slaves.RetentionStrategy;
 import hudson.slaves.WorkspaceList;
 import hudson.slaves.OfflineCause;
@@ -63,9 +64,11 @@ import org.kohsuke.stapler.QueryParameter;
 import org.kohsuke.stapler.HttpResponses;
 import org.kohsuke.stapler.HttpResponse;
 import org.kohsuke.stapler.HttpRedirect;
+import org.kohsuke.stapler.WebMethod;
 import org.kohsuke.stapler.export.Exported;
 import org.kohsuke.stapler.export.ExportedBean;
 import org.kohsuke.args4j.Option;
+import org.kohsuke.stapler.interceptor.RequirePOST;
 
 import javax.servlet.ServletException;
 import java.io.File;
@@ -85,6 +88,8 @@ import java.nio.charset.Charset;
 import java.net.InetAddress;
 import java.net.NetworkInterface;
 import java.net.Inet4Address;
+
+import static javax.servlet.http.HttpServletResponse.*;
 
 /**
  * Represents the running state of a remote computer that holds {@link Executor}s.
@@ -154,6 +159,13 @@ public /*transient*/ abstract class Computer extends Actionable implements Acces
         setNode(node);
     }
 
+     /**
+     * Returns list of all boxes {@link ComputerPanelBox}s.
+     */
+    public List<ComputerPanelBox> getComputerPanelBoxs(){
+        return ComputerPanelBox.all(this);
+    }
+    
     /**
      * Returns the transient {@link Action}s associated with the computer.
      */
@@ -305,7 +317,7 @@ public /*transient*/ abstract class Computer extends Actionable implements Acces
      */
     @CLIMethod(name="connect-node")
     public void cliConnect(@Option(name="-f",usage="Cancel any currently pending connect operation and retry from scratch") boolean force) throws ExecutionException, InterruptedException {
-        checkPermission(Jenkins.ADMINISTER);
+        checkPermission(CONNECT);
         connect(force).get();
     }
 
@@ -361,7 +373,7 @@ public /*transient*/ abstract class Computer extends Actionable implements Acces
      */
     @CLIMethod(name="disconnect-node")
     public void cliDisconnect(@Option(name="-m",usage="Record the note about why you are disconnecting this node") String cause) throws ExecutionException, InterruptedException {
-        checkPermission(Jenkins.ADMINISTER);
+        checkPermission(DISCONNECT);
         disconnect(new ByCLI(cause)).get();
     }
 
@@ -370,13 +382,13 @@ public /*transient*/ abstract class Computer extends Actionable implements Acces
      */
     @CLIMethod(name="offline-node")
     public void cliOffline(@Option(name="-m",usage="Record the note about why you are disconnecting this node") String cause) throws ExecutionException, InterruptedException {
-        checkPermission(Jenkins.ADMINISTER);
+        checkPermission(DISCONNECT);
         setTemporarilyOffline(true,new ByCLI(cause));
     }
 
     @CLIMethod(name="online-node")
     public void cliOnline() throws ExecutionException, InterruptedException {
-        checkPermission(Jenkins.ADMINISTER);
+        checkPermission(CONNECT);
         setTemporarilyOffline(false,null);
     }
 
@@ -531,6 +543,10 @@ public /*transient*/ abstract class Computer extends Actionable implements Acces
         Jenkins.getInstance().getQueue().scheduleMaintenance();
         synchronized (statusChangeLock) {
             statusChangeLock.notifyAll();
+        }
+        for (ComputerListener cl : ComputerListener.all()) {
+            if (temporarilyOffline)     cl.onTemporarilyOffline(this,cause);
+            else                        cl.onTemporarilyOnline(this);
         }
     }
 
@@ -889,9 +905,8 @@ public /*transient*/ abstract class Computer extends Actionable implements Acces
 
         // allow the administrator to manually specify the host name as a fallback. HUDSON-5373
         cachedHostName = channel.call(new GetFallbackName());
-
         hostNameCached = true;
-        return null;
+        return cachedHostName;
     }
 
     /**
@@ -963,14 +978,15 @@ public /*transient*/ abstract class Computer extends Actionable implements Acces
     }
 
     public HttpResponse doToggleOffline(@QueryParameter String offlineMessage) throws IOException, ServletException {
-        checkPermission(Jenkins.ADMINISTER);
         if(!temporarilyOffline) {
+            checkPermission(DISCONNECT);
             offlineMessage = Util.fixEmptyAndTrim(offlineMessage);
             setTemporarilyOffline(!temporarilyOffline,
                     OfflineCause.create(hudson.slaves.Messages._SlaveComputer_DisconnectedBy(
                         Jenkins.getAuthentication().getName(),
                         offlineMessage!=null ? " : " + offlineMessage : "")));
         } else {
+            checkPermission(CONNECT);
             setTemporarilyOffline(!temporarilyOffline,null);
         }
         return HttpResponses.redirectToDot();
@@ -1043,39 +1059,70 @@ public /*transient*/ abstract class Computer extends Actionable implements Acces
             }
         }
 
-        req.getView(this,view).forward(req,rsp);
+        req.getView(this,view).forward(req, rsp);
     }
 
     /**
      * Accepts the update to the node configuration.
      */
+    @RequirePOST
     public void doConfigSubmit( StaplerRequest req, StaplerResponse rsp ) throws IOException, ServletException, FormException {
         checkPermission(CONFIGURE);
 
         String name = Util.fixEmptyAndTrim(req.getSubmittedForm().getString("name"));
         Jenkins.checkGoodName(name);
         
-        final Jenkins app = Jenkins.getInstance();
-
         Node result = getNode().reconfigure(req, req.getSubmittedForm());
+        replaceBy(result);
+
+        // take the user back to the slave top page.
+        rsp.sendRedirect2("../" + result.getNodeName() + '/');
+    }
+
+    /**
+     * Accepts <tt>config.xml</tt> submission, as well as serve it.
+     */
+    @WebMethod(name = "config.xml")
+    public void doConfigDotXml(StaplerRequest req, StaplerResponse rsp)
+            throws IOException, ServletException {
+        checkPermission(Jenkins.ADMINISTER);
+        if (req.getMethod().equals("GET")) {
+            // read
+            rsp.setContentType("application/xml");
+            Jenkins.XSTREAM2.toXML(getNode(), rsp.getOutputStream());
+            return;
+        }
+        if (req.getMethod().equals("POST")) {
+            // submission
+            Node result = (Node)Jenkins.XSTREAM2.fromXML(req.getReader());
+
+            replaceBy(result);
+            return;
+        }
+
+        // huh?
+        rsp.sendError(SC_BAD_REQUEST);
+    }
+
+    /**
+     * Replaces the current {@link Node} by another one.
+     */
+    private void replaceBy(Node newNode) throws ServletException, IOException {
+        final Jenkins app = Jenkins.getInstance();
 
         // replace the old Node object by the new one
         synchronized (app) {
             List<Node> nodes = new ArrayList<Node>(app.getNodes());
             int i = nodes.indexOf(getNode());
             if(i<0) {
-                sendError("This slave appears to be removed while you were editing the configuration",req,rsp);
-                return;
+                throw new IOException("This slave appears to be removed while you were editing the configuration");
             }
 
-            nodes.set(i,result);
+            nodes.set(i, newNode);
             app.setNodes(nodes);
         }
-
-        // take the user back to the slave top page.
-        rsp.sendRedirect2("../"+result.getNodeName()+'/');
     }
-    
+
     /**
      * Really deletes the slave.
      */
@@ -1158,6 +1205,8 @@ public /*transient*/ abstract class Computer extends Actionable implements Acces
     public static final Permission CONFIGURE = new Permission(PERMISSIONS,"Configure", Messages._Computer_ConfigurePermission_Description(), Permission.CONFIGURE, PermissionScope.COMPUTER);
     public static final Permission DELETE = new Permission(PERMISSIONS,"Delete", Messages._Computer_DeletePermission_Description(), Permission.DELETE, PermissionScope.COMPUTER);
     public static final Permission CREATE = new Permission(PERMISSIONS,"Create", Messages._Computer_CreatePermission_Description(), Permission.CREATE);
+    public static final Permission DISCONNECT = new Permission(PERMISSIONS,"Disconnect", Messages._Computer_DisconnectPermission_Description(), Jenkins.ADMINISTER, PermissionScope.COMPUTER);
+    public static final Permission CONNECT = new Permission(PERMISSIONS,"Connect", Messages._Computer_ConnectPermission_Description(), DISCONNECT, PermissionScope.COMPUTER);
 
     private static final Logger LOGGER = Logger.getLogger(Computer.class.getName());
 }

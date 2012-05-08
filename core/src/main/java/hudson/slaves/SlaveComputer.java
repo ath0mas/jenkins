@@ -24,6 +24,7 @@
 package hudson.slaves;
 
 import hudson.model.*;
+import hudson.util.IOUtils;
 import hudson.util.io.ReopenableRotatingFileOutputStream;
 import jenkins.model.Jenkins.MasterComputer;
 import hudson.remoting.Channel;
@@ -232,8 +233,11 @@ public class SlaveComputer extends Computer {
         if (launcher instanceof ExecutorListener) {
             ((ExecutorListener)launcher).taskAccepted(executor, task);
         }
-        if (getNode().getRetentionStrategy() instanceof ExecutorListener) {
-            ((ExecutorListener)getNode().getRetentionStrategy()).taskAccepted(executor, task);
+        
+        //getNode() can return null at indeterminate times when nodes go offline
+        Slave node = getNode();
+        if (node != null && node.getRetentionStrategy() instanceof ExecutorListener) {
+            ((ExecutorListener)node.getRetentionStrategy()).taskAccepted(executor, task);
         }
     }
 
@@ -309,25 +313,33 @@ public class SlaveComputer extends Computer {
      *      so the implementation of the listener doesn't need to do that again.
      */
     public void setChannel(InputStream in, OutputStream out, OutputStream launchLog, Channel.Listener listener) throws IOException, InterruptedException {
+        Channel channel = new Channel(nodeName,threadPoolForRemoting, Channel.Mode.NEGOTIATE, in,out, launchLog);
+        setChannel(channel,launchLog,listener);
+    }
+
+    /**
+     * Sets up the connection through an exsting channel.
+     *
+     * @since 1.444
+     */
+    public void setChannel(Channel channel, OutputStream launchLog, Channel.Listener listener) throws IOException, InterruptedException {
         if(this.channel!=null)
             throw new IllegalStateException("Already connected");
 
         final TaskListener taskListener = new StreamTaskListener(launchLog);
         PrintStream log = taskListener.getLogger();
 
-        Channel channel = new Channel(nodeName,threadPoolForRemoting, Channel.Mode.NEGOTIATE,
-            in,out, launchLog);
         channel.addListener(new Channel.Listener() {
             @Override
             public void onClosed(Channel c, IOException cause) {
-                SlaveComputer.this.channel = null;
                 // Orderly shutdown will have null exception
                 if (cause!=null) {
                     offlineCause = new ChannelTermination(cause);
-                     cause.printStackTrace(taskListener.error("Connection terminated"));
+                    cause.printStackTrace(taskListener.error("Connection terminated"));
                 } else {
                     taskListener.getLogger().println("Connection terminated");
                 }
+                closeChannel();
                 launcher.afterDisconnect(SlaveComputer.this, taskListener);
             }
         });
@@ -409,7 +421,7 @@ public class SlaveComputer extends Computer {
     public HttpResponse doDoDisconnect(@QueryParameter String offlineMessage) throws IOException, ServletException {
         if (channel!=null) {
             //does nothing in case computer is already disconnected
-            checkPermission(Jenkins.ADMINISTER);
+            checkPermission(DISCONNECT);
             offlineMessage = Util.fixEmptyAndTrim(offlineMessage);
             disconnect(OfflineCause.create(Messages._SlaveComputer_DisconnectedBy(
                     Jenkins.getAuthentication().getName(),
@@ -470,6 +482,7 @@ public class SlaveComputer extends Computer {
     protected void kill() {
         super.kill();
         closeChannel();
+        IOUtils.closeQuietly(log);
     }
 
     public RetentionStrategy getRetentionStrategy() {
@@ -491,9 +504,9 @@ public class SlaveComputer extends Computer {
             } catch (IOException e) {
                 logger.log(Level.SEVERE, "Failed to terminate channel to " + getDisplayName(), e);
             }
+            for (ComputerListener cl : ComputerListener.all())
+                cl.onOffline(this);
         }
-        for (ComputerListener cl : ComputerListener.all())
-            cl.onOffline(this);
     }
 
     @Override

@@ -15,72 +15,69 @@
  */
 package hudson.maven.settings;
 
-import hudson.ExtensionList;
 import hudson.FilePath;
-import org.apache.commons.io.FileUtils;
-import org.apache.commons.io.IOUtils;
-import org.jenkinsci.lib.configprovider.ConfigProvider;
-import org.jenkinsci.lib.configprovider.model.Config;
 
-import java.io.ByteArrayInputStream;
 import java.io.File;
 import java.io.IOException;
+import java.util.List;
+
+import org.apache.commons.io.FileUtils;
 
 /**
  * @author Olivier Lamy
+ * @author Dominik Bartholdi (imod)
  * @since 1.426
  */
 public class SettingsProviderUtils {
 
-    /**
-     * utility method to retrieve Config of type (MavenSettingsProvider etc..)
-     * @param settingsConfigId
-     * @param type
-     * @return Config
-     */
-    public static Config findConfig(String settingsConfigId, Class<?> type) {
-        ExtensionList<ConfigProvider> configProviders = ConfigProvider.all();
-        if (configProviders != null && configProviders.size() > 0) {
-            for (ConfigProvider configProvider : configProviders) {
-                if (type.isAssignableFrom( configProvider.getClass() ) ) {
-                    if ( configProvider.isResponsibleFor( settingsConfigId ) ) {
-                        return configProvider.getConfigById( settingsConfigId );
-                    }
-                }
-            }
-        }
-        return null;
+    private static ConfigProviderFacade configProvider = new ConfigProviderDelegate();
+
+    private SettingsProviderUtils() {
     }
 
     /**
-     *
+     * @since 1.426
+     * @return
+     */
+    public static List<SettingConfig> getAllMavenSettingsConfigs() {
+        return configProvider.getAllMavenSettingsConfigs();
+    }
+
+    /**
+     * @since 1.426
+     * @return
+     */
+    public static List<SettingConfig> getAllGlobalMavenSettingsConfigs() {
+        return configProvider.getAllGlobalMavenSettingsConfigs();
+    }
+
+    /**
+     * utility method to retrieve Config of type (MavenSettingsProvider etc..)
+     * 
+     * @param settingsConfigId
+     * @param type
+     * @return SettingConfig
+     */
+    public static SettingConfig findSettings(String settingsConfigId) {
+        return configProvider.findConfig(settingsConfigId);
+    }
+
+    /**
+     * 
      * @param config
      * @param workspace
      */
-    public static FilePath copyConfigContentToFilePath(Config config, FilePath workspace) throws IOException, InterruptedException {
-        File tmpContentFile = null;
-        ByteArrayInputStream bs = null;
-
-        try {
-            tmpContentFile = File.createTempFile( "config", "tmp" );
-            FilePath filePath = new FilePath( workspace, tmpContentFile.getName() );
-            bs = new ByteArrayInputStream(config.content.getBytes());
-            filePath.copyFrom(bs);
-            return filePath;
-        } finally {
-           FileUtils.deleteQuietly( tmpContentFile );
-           IOUtils.closeQuietly( bs );
-        }
+    public static FilePath copyConfigContentToFilePath(SettingConfig config, FilePath workspace) throws IOException, InterruptedException {
+        return workspace.createTextTempFile("config", ".tmp", config.content, false);
     }
 
     /**
-     *
      * @return a temp file which must be deleted after use
      */
-    public static File copyConfigContentToFile(Config config) throws IOException{
-
-        File tmpContentFile = File.createTempFile( "config", "tmp" );
-        FileUtils.writeStringToFile( tmpContentFile, config.content );
+    public static File copyConfigContentToFile(SettingConfig config) throws IOException {
+        File tmpContentFile = File.createTempFile("config", "tmp");
+        FileUtils.writeStringToFile(tmpContentFile, config.content);
         return tmpContentFile;
     }
+
 }

@@ -25,6 +25,7 @@ package hudson;
 
 import hudson.Proc.LocalProc;
 import hudson.model.Computer;
+import hudson.util.QuotedStringTokenizer;
 import jenkins.model.Jenkins;
 import hudson.model.TaskListener;
 import hudson.model.Node;
@@ -158,6 +159,14 @@ public abstract class Launcher {
          * @since 1.399
          */
         protected boolean reverseStdin, reverseStdout, reverseStderr;
+
+        /**
+         * Passes a white-space separated single-string command (like "cat abc def") and parse them
+         * as a command argument. This method also handles quotes.
+         */
+        public ProcStarter cmdAsSingleString(String s) {
+            return cmds(QuotedStringTokenizer.tokenize(s));
+        }
 
         public ProcStarter cmds(String... args) {
             return cmds(Arrays.asList(args));
@@ -643,7 +652,9 @@ public abstract class Launcher {
             @Override
             public Proc launch(ProcStarter starter) throws IOException {
                 starter.commands.addAll(0,Arrays.asList(prefix));
-                starter.masks = prefix(starter.masks);
+                if (starter.masks != null) {
+                    starter.masks = prefix(starter.masks);
+                }
                 return outer.launch(starter);
             }
 
@@ -880,7 +891,7 @@ public abstract class Launcher {
     /**
      * Remoting interface of a remote process
      */
-    public static interface RemoteProcess {
+    public interface RemoteProcess {
         int join() throws InterruptedException, IOException;
         void kill() throws IOException, InterruptedException;
         boolean isAlive() throws IOException, InterruptedException;

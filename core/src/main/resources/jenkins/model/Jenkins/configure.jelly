@@ -29,6 +29,7 @@ THE SOFTWARE.
 <j:jelly xmlns:j="jelly:core" xmlns:st="jelly:stapler" xmlns:d="jelly:define" xmlns:l="/lib/layout" xmlns:t="/lib/hudson" xmlns:f="/lib/form">
 <l:layout norefresh="true" permission="${it.ADMINISTER}" title="${%Configure System}">
   <st:include page="sidepanel.jelly" />
+  <f:breadcrumb-config-outline />
   <l:main-panel>
     <div class="behavior-loading">${%LOADING}</div>
     <f:form method="post" name="config" action="configSubmit">
@@ -48,7 +49,7 @@ THE SOFTWARE.
       </f:advanced>
       <f:entry title="${%System Message}" help="/help/system-config/systemMessage.html">
         <f:textarea name="system_message" value="${it.systemMessage}"
-                    codemirror-mode="${app.markupFormatter.codeMirrorMode}" codemirror-config="${app.markupFormatter.codeMirrorConfig}"/>
+                    codemirror-mode="${app.markupFormatter.codeMirrorMode}" codemirror-config="${app.markupFormatter.codeMirrorConfig}" previewEndpoint="/markupFormatter/previewDescription"/>
       </f:entry>
 
       <!-- global configuration from everyone -->
@@ -60,7 +61,12 @@ THE SOFTWARE.
       </j:forEach>
 
       <f:block>
-        <f:submit value="${%Save}" />
+        <div id="bottom-sticker" >
+          <div class="bottom-sticker-inner">
+            <f:submit value="${%Save}" />
+            <f:apply />
+          </div>
+        </div>
       </f:block>
     </f:form>
   </l:main-panel>

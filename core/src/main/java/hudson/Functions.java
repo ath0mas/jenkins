@@ -47,6 +47,7 @@ import hudson.tasks.BuildWrapper;
 import hudson.tasks.BuildWrappers;
 import hudson.tasks.Builder;
 import hudson.tasks.Publisher;
+import hudson.tasks.UserAvatarResolver;
 import hudson.util.Area;
 import hudson.util.Iterators;
 import hudson.scm.SCM;
@@ -64,7 +65,7 @@ import org.apache.commons.jelly.Script;
 import org.apache.commons.jelly.XMLOutput;
 import org.apache.commons.jexl.parser.ASTSizeFunction;
 import org.apache.commons.jexl.util.Introspector;
-import org.jvnet.animal_sniffer.IgnoreJRERequirement;
+import org.codehaus.mojo.animal_sniffer.IgnoreJRERequirement;
 import org.jvnet.tiger_types.Types;
 import org.kohsuke.stapler.Ancestor;
 import org.kohsuke.stapler.Stapler;
@@ -150,6 +151,16 @@ public class Functions {
 
     public static String rfc822Date(Calendar cal) {
         return Util.RFC822_DATETIME_FORMATTER.format(cal.getTime());
+    }
+    
+    public static void initPageVariables(JellyContext context) {
+        String rootURL = Stapler.getCurrentRequest().getContextPath();
+        Functions h = new Functions();
+
+        context.setVariable("rootURL", rootURL);
+        context.setVariable("h", h);
+        context.setVariable("resURL",rootURL+getResourcePath());
+        context.setVariable("imagesURL",rootURL+getResourcePath()+"/images");
     }
 
     /**
@@ -646,7 +657,7 @@ public class Functions {
         StringBuilder buf = new StringBuilder();
         buf.append(req.getScheme()).append("://");
         buf.append(req.getServerName());
-        if(req.getLocalPort()!=80)
+        if(! (req.getScheme().equals("http") && req.getLocalPort()==80 || req.getScheme().equals("https") && req.getLocalPort()==443))
             buf.append(':').append(req.getLocalPort());
         buf.append(req.getContextPath()).append('/');
         return buf.toString();
@@ -791,7 +802,8 @@ public class Functions {
      */
     public static String getIconFilePath(Action a) {
         String name = a.getIconFileName();
-        if(name.startsWith("/"))
+        if (name==null)     return null;
+        if (name.startsWith("/"))
             return name.substring(1);
         else
             return "images/24x24/"+name;
@@ -1162,19 +1174,37 @@ public class Functions {
     }
 
     /**
+     * Combine path components via '/' while handling leading/trailing '/' to avoid duplicates.
+     */
+    public static String joinPath(String... components) {
+        StringBuilder buf = new StringBuilder();
+        for (String s : components) {
+            if (s.length()==0)  continue;
+
+            if (buf.length()>0) {
+                if (buf.charAt(buf.length()-1)!='/')
+                    buf.append('/');
+                if (s.charAt(0)=='/')   s=s.substring(1);
+            }
+            buf.append(s);
+        }
+        return buf.toString();
+    }
+
+    /**
      * Computes the hyperlink to actions, to handle the situation when the {@link Action#getUrlName()}
      * returns absolute URL.
      */
     public static String getActionUrl(String itUrl,Action action) {
         String urlName = action.getUrlName();
         if(urlName==null)   return null;    // to avoid NPE and fail to render the whole page
-        if(SCHEME.matcher(urlName).matches())
+        if(SCHEME.matcher(urlName).find())
             return urlName; // absolute URL
         if(urlName.startsWith("/"))
-            return Stapler.getCurrentRequest().getContextPath()+urlName;
+            return joinPath(Stapler.getCurrentRequest().getContextPath(),urlName);
         else
             // relative URL name
-            return Stapler.getCurrentRequest().getContextPath()+'/'+itUrl+urlName;
+            return joinPath(Stapler.getCurrentRequest().getContextPath()+'/'+itUrl,urlName);
     }
 
     /**
@@ -1362,7 +1392,7 @@ public class Functions {
         return DescriptorVisibilityFilter.apply(context,descriptors);
     }
     
-    private static final Pattern SCHEME = Pattern.compile("[a-z]+://.+");
+    private static final Pattern SCHEME = Pattern.compile("^([a-zA-Z][a-zA-Z0-9+.-]*):");
 
     /**
      * Returns true if we are running unit tests.
@@ -1446,4 +1476,22 @@ public class Functions {
         return all;
     }
 
+    /**
+     * Returns an avatar image URL for the specified user and preferred image size
+     * @param user the user
+     * @param avatarSize the preferred size of the avatar image
+     * @return a URL string
+     * @since 1.433
+     */
+    public static String getAvatar(User user, String avatarSize) {
+        return UserAvatarResolver.resolve(user, avatarSize);
+    }
+
+    /**
+     * @deprecated as of 1.451
+     *      Use {@link #getAvatar}
+     */
+    public String getUserAvatar(User user, String avatarSize) {
+        return getAvatar(user,avatarSize);
+    }
 }

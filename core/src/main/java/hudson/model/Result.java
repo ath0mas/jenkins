@@ -27,10 +27,13 @@ import com.thoughtworks.xstream.converters.SingleValueConverter;
 import com.thoughtworks.xstream.converters.basic.AbstractSingleValueConverter;
 import hudson.cli.declarative.OptionHandlerExtension;
 import hudson.util.EditDistance;
+import hudson.util.EnumConverter;
+import org.apache.commons.beanutils.Converter;
 import org.kohsuke.args4j.CmdLineException;
 import org.kohsuke.args4j.CmdLineParser;
 import org.kohsuke.args4j.OptionDef;
 import org.kohsuke.args4j.spi.*;
+import org.kohsuke.stapler.Stapler;
 import org.kohsuke.stapler.export.CustomExportedBean;
 
 import java.io.Serializable;
@@ -62,7 +65,7 @@ public final class Result implements Serializable, CustomExportedBean {
      * This status code is used in a multi-stage build (like maven2)
      * where a problem in earlier stage prevented later stages from building.
      */
-    public static final Result NOT_BUILT = new Result("NOT_BUILT",BallColor.GREY,3);
+    public static final Result NOT_BUILT = new Result("NOT_BUILT",BallColor.NOTBUILT,3);
     /**
      * The build was manually aborted.
      *
@@ -182,5 +185,13 @@ public final class Result implements Serializable, CustomExportedBean {
         public String getDefaultMetaVariable() {
             return "STATUS";
         }
+    }
+
+    static {
+        Stapler.CONVERT_UTILS.register(new Converter() {
+            public Object convert(Class type, Object value) {
+                return Result.fromString(value.toString());
+            }
+        }, Result.class);
     }
 }
